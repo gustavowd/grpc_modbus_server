@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package sunspec.telemetry.v1;
+
+// Serviço que disponibiliza os dados dos equipamentos
+service SunSpecTelemetryService {
+  // O cliente se conecta e recebe um fluxo contínuo de atualizações do barramento
+  rpc StreamEquipmentUpdates (StreamRequest) returns (stream EquipmentDataResponse);
+}
+
+message StreamRequest {
+  // Permite filtrar por um equipamento específico, se vazio envia de todos
+  string equipment_id = 1; 
+}
+
+message EquipmentDataResponse {
+  string equipment_id = 1;     // Identificador único (ex: "inv-01")
+  uint64 timestamp_ms = 2;     // Momento da leitura no Modbus
+  
+  oneof model_data {
+    Model1Common common_data = 3;     // Dados do Modelo 1 (Se disponível)
+    Model213Meter meter_data = 4;     // Dados do Modelo 213 (Se disponível)
+    Model103Inverter inverter_data = 5;
+  }
+}
+
+// --- SUNSPEC MODELO 1: Common Model ---
+// Identifica o fabricante, modelo, versão, número de série, etc.
+message Model1Common {
+  string manufacturer = 1;  // Mn
+  string model = 2;         // Md
+  string options = 3;       // Opt
+  string version = 4;       // Vr
+  string serial_number = 5; // SN
+  uint32 da_id = 6;         // Device Address ID
+}
+
+// --- SUNSPEC MODELO 213: Three Phase Meter (Float) ---
+// Modelo de medidor trifásico utilizando pontos flutuantes (dispensa scale factors)
+message Model213Meter {
+  float ampers = 1;          // A: Corrente Total
+  float ampers_phase_a = 2;  // AphA: Corrente Fase A
+  float ampers_phase_b = 3;  // AphB: Corrente Fase B
+  float ampers_phase_c = 4;  // AphC: Corrente Fase C
+  
+  float voltage_ln = 5;      // V: Tensão Linha-Neutro média
+  float voltage_phase_a = 6; // VphA: Tensão Fase A
+  float voltage_phase_b = 7; // VphB: Tensão Fase B
+  float voltage_phase_c = 8; // VphC: Tensão Fase C
+  
+  float hz = 9;              // Hz: Frequência
+  
+  float real_power = 10;     // W: Potência Ativa Total (Watts)
+  float reactive_power = 11; // VAr: Potência Reativa Total
+  float apparent_power = 12; // VA: Potência Aparente Total
+  float power_factor = 13;   // PF: Fator de Potência Médio
+  
+  float total_watt_hours = 14; // Wh: Energia Ativa Total Consumida
+}
+
+message Model103Inverter {
+  float ac_power = 1;
+  float dc_voltage = 2;
+}

@@ -1,0 +1,45 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'grpc_modbus_server'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=grpc_modbus_server",
+                    "--package=grpc_modbus_server"
+                ],
+                "filter": {
+                    "name": "grpc_modbus_server",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'grpc_modbus_server'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=grpc_modbus_server",
+                    "--package=grpc_modbus_server"
+                ],
+                "filter": {
+                    "name": "grpc_modbus_server",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

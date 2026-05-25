@@ -1,0 +1,15 @@
+[package]
+name = "grpc_modbus_server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tonic = { version = "0.14.6", features = ["codegen", "server", "transport"] }
+prost = "0.14.3" # Manipulação de Protocol Buffers
+tonic-prost = "*"
+tokio-modbus = "0.17.0" # Biblioteca excelente para Modbus assíncrono
+
+[build-dependencies]
+tonic-prost-build = { version = "0.14.6", features = ["transport"] }
