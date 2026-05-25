@@ -4,6 +4,10 @@ use tokio::sync::broadcast;
 use tokio_modbus::client::Reader;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request, Response, Status};
+use std::fs;
+use std::path::Path;
+use tokio::net::UnixListener;
+use tokio_stream::wrappers::UnixListenerStream;
 
 // Autogerado pelo tonic-build a partir do proto
 pub mod sunspec_grpc {
@@ -149,15 +153,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Inicia a tarefa de leitura em segundo plano (Worker)
     tokio::spawn(modbus_reader_task(tx.clone(), modbus_target));
 
-    // Endereço onde o servidor gRPC vai escutar requisições de outros softwares
-    let grpc_addr: SocketAddr = "0.0.0.0:50051".parse()?;
-    println!("Servidor gRPC SunSpec rodando em {}", grpc_addr);
+    let socket_path = "/tmp/sunspec.sock";
+
+    // 1. Se o arquivo do socket já existir de uma execução anterior, nós o deletamos
+    if Path::new(socket_path).exists() {
+        fs::remove_file(socket_path)?;
+    }
+
+    // 2. Criamos o escutador Unix nativo do Tokio
+    let uds = UnixListener::bind(socket_path)?;
+    let uds_stream = UnixListenerStream::new(uds);
+
+    println!("Servidor gRPC Modbus rodando via UDS em: {}", socket_path);
 
     let telemetry_service = TelemetryServer { tx };
 
     Server::builder()
         .add_service(SunSpecTelemetryServiceServer::new(telemetry_service))
-        .serve(grpc_addr)
+        .serve_with_incoming(uds_stream)
         .await?;
 
     Ok(())
