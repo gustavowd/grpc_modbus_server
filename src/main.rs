@@ -1,24 +1,25 @@
-use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_modbus::client::Reader;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_modbus::client::tcp;
+use tokio_stream::wrappers::{BroadcastStream, UnixListenerStream};
+use tokio_stream::StreamExt;
 use tonic::{transport::Server, Request, Response, Status};
 use std::fs;
-use std::path::Path;
 use tokio::net::UnixListener;
-use tokio_stream::wrappers::UnixListenerStream;
 
 // Autogerado pelo tonic-build a partir do proto
 pub mod sunspec_grpc {
     tonic::include_proto!("sunspec.telemetry.v1");
 }
 
-use sunspec_grpc::sun_spec_telemetry_service_server::{SunSpecTelemetryService, SunSpecTelemetryServiceServer};
-use sunspec_grpc::{EquipmentDataResponse, Model1Common, Model213Meter, StreamRequest};
 use sunspec_grpc::equipment_data_response::ModelData;
+use sunspec_grpc::sun_spec_telemetry_service_server::{
+    SunSpecTelemetryService, SunSpecTelemetryServiceServer,
+};
+use sunspec_grpc::{EquipmentDataResponse, Model1Common, Model213Meter, StreamRequest};
 
-// --- 1. A ESTRUTURA DO SERVIDOR gRPC ---
+// --- ESTRUTURA DO SERVIDOR gRPC ---
 pub struct TelemetryServer {
     // Canal de broadcast para enviar dados a múltiplos clientes conectados simultaneamente
     tx: broadcast::Sender<EquipmentDataResponse>,
@@ -26,112 +27,96 @@ pub struct TelemetryServer {
 
 #[tonic::async_trait]
 impl SunSpecTelemetryService for TelemetryServer {
-    type StreamEquipmentUpdatesStream = ReceiverStream<Result<EquipmentDataResponse, Status>>;
+    // Retornamos um stream 'pinned' encadeado por combinadores
+    type StreamEquipmentUpdatesStream =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<EquipmentDataResponse, Status>> + Send>>;
 
     async fn stream_equipment_updates(
         &self,
         _request: Request<StreamRequest>,
     ) -> Result<Response<Self::StreamEquipmentUpdatesStream>, Status> {
-        
-        // Criamos um receptor para este cliente específico
-        let mut rx = self.tx.subscribe();
-        // Canal mpsc interno exigido pelo Tonic para fazer o stream de saída
-        let (grpc_tx, grpc_rx) = tokio::sync::mpsc::channel(128);
+        let rx = self.tx.subscribe();
 
-        // Task assíncrona que escuta o broadcast do Modbus e empurra para a rede gRPC
-        tokio::spawn(async move {
-            while let Ok(data) = rx.recv().await {
-                if grpc_tx.send(Ok(data)).await.is_err() {
-                    // Cliente desconectou, encerra a task de repasse
-                    break;
-                }
+        // Converte o broadcast em Stream tratando erros de lag de forma idiomática
+        let stream = BroadcastStream::new(rx).filter_map(|res| match res {
+            Ok(data) => Some(Ok(data)),
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(skipped)) => {
+                eprintln!("Cliente gRPC perdeu {skipped} mensagens (buffer cheio)");
+                None // Descarta o atraso e aguarda a próxima mensagem
             }
         });
 
-        Ok(Response::new(ReceiverStream::new(grpc_rx)))
+        Ok(Response::new(Box::pin(stream)))
     }
 }
 
-// Loop de leitura Modbus (SunSpec)
-async fn modbus_reader_task(tx: broadcast::Sender<EquipmentDataResponse>, modbus_addr: SocketAddr) {
-    use tokio_modbus::client::tcp;
-
+// --- WORKER MODBUS ---
+async fn modbus_reader_task(
+    tx: broadcast::Sender<EquipmentDataResponse>,
+    modbus_addr: std::net::SocketAddr,
+) {
     loop {
-        // Tenta conectar ao inversor/medidor SunSpec Modbus TCP
-        if let Ok(mut ctx) = tcp::connect(modbus_addr).await {
-            println!("Conectado ao equipamento SunSpec via Modbus TCP.");
+        match tcp::connect(modbus_addr).await {
+            Ok(mut ctx) => {
+                println!("Conectado ao equipamento SunSpec via Modbus TCP.");
 
-            // Leitura do modelo 1
-            // Registrador base SunSpec geralmente começa em 40001 (ou offset 0 dependendo do mapeamento)
-            // Vamos simular a leitura do bloco do Modelo 1 (comprimento de 66 registradores)
-            if let Ok(_regs_m1) = ctx.read_input_registers(40002, 66).await {
-                // No Rust real, você decodificaria a string limpando os bytes nulos:
-                // let manufacturer = String::from_utf8_lossy(&regs_m1[..16]).trim().to_string();
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+
+                loop {
+                    interval.tick().await; // Timer preciso (melhor que sleep)
+
+                    // Leitura do Modelo 213 (Medidor Trifásico)
+                    if let Ok(Ok(regs)) = ctx.read_holding_registers(40072, 60).await {
+                        let meter = Model213Meter {
+                            ampers: u16_to_f32(regs[0], regs[1]),
+                            ampers_phase_a: u16_to_f32(regs[2], regs[3]),
+                            hz: 60.0,
+                            real_power: u16_to_f32(regs[10], regs[11]),
+                            ..Default::default()
+                        };
+
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+
+                        let payload = EquipmentDataResponse {
+                            equipment_id: "inversor_central_01".to_string(),
+                            timestamp_ms: timestamp,
+                            model_data: Some(ModelData::MeterData(meter)),
+                        };
+
+                        // Publica no barramento; se não houver clientes ativos, o erro é ignorado com sucesso
+                        let _ = tx.send(payload);
+
+                        let payload2 = EquipmentDataResponse {
+                            equipment_id: "inversor_central_01".to_string(),
+                            timestamp_ms: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .expect("O relógio do sistema está atrasado")
+                                .as_millis() as u64,
+                                model_data: Some(ModelData::CommonData(Model1Common {
+                                    manufacturer: "Schneider".to_string(),
+                                    model: "iEM3000".to_string(),
+                                    options: "N/A".to_string(),
+                                    version: "1.0".to_string(),
+                                    serial_number: "SN-12345".to_string(),
+                                    da_id: 1,
+                                })),
+                        };
+
+                        let _ = tx.send(payload2);
+                    } else {
+                        eprintln!("Falha na leitura dos registradores Modbus.");
+                        break; // Quebra o loop interno para tentar reconectar o socket
+                    }
+                }
             }
-
-            loop {
-                // Leitura modelo 213
-                // Simulando a leitura do medidor trifásico e convertendo para float
-                // O Modelo 213 do SunSpec usa floats de 32 bits (2 registradores por valor)
-                let model_213: Option<Model213Meter> = if let Ok(Ok(regs_m213)) = ctx.read_holding_registers(40072, 60).await {
-                    Some(Model213Meter {
-                        ampers: u16_to_f32(regs_m213[0], regs_m213[1]),
-                        ampers_phase_a: u16_to_f32(regs_m213[2], regs_m213[3]),
-                        // ... demais fases ...
-                        hz: 60.0,
-                        real_power: u16_to_f32(regs_m213[10], regs_m213[11]),
-                        ..Default::default()
-                    })
-                } else {
-                    None
-                };
-
-                // Monta o payload gRPC padronizado
-                let payload = EquipmentDataResponse {
-                    equipment_id: "inversor_central_01".to_string(),
-                    timestamp_ms: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .expect("O relógio do sistema está atrasado")
-                        .as_millis() as u64,
-                        model_data: Some(ModelData::MeterData(model_213.unwrap_or_default())), // Aqui você pode escolher qual modelo enviar ou criar uma enum para múltiplos modelos
-                        /*
-                    common_data: Some(Model1Common {
-                        manufacturer: "Fabricante X".to_string(),
-                        model: "Modelo Y".to_string(),
-                        ..Default::default()
-                    }),
-                    meter_data: model_213,
-                     */
-                };
-
-                // Publica no barramento em memória (gRPC vai pegar isso e mandar pros clientes)
-                let _ = tx.send(payload);
-
-                let payload2 = EquipmentDataResponse {
-                    equipment_id: "inversor_central_01".to_string(),
-                    timestamp_ms: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .expect("O relógio do sistema está atrasado")
-                        .as_millis() as u64,
-                        model_data: Some(ModelData::CommonData(Model1Common {
-                            manufacturer: "Schneider".to_string(),
-                            model: "iEM3000".to_string(),
-                            options: "N/A".to_string(),
-                            version: "1.0".to_string(),
-                            serial_number: "SN-12345".to_string(),
-                            da_id: 1,
-                        })),
-                };
-
-                let _ = tx.send(payload2);
-
-                // Intervalo de leitura (Ex: a cada 1 segundo)
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            Err(err) => {
+                eprintln!("Erro ao conectar no Modbus: {err}. Tentando novamente em 5s...");
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
-
-        eprintln!("Falha ao conectar ou ler o Modbus. Tentando novamente em 5 segundos...");
-        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 
@@ -141,35 +126,31 @@ fn u16_to_f32(high: u16, low: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-
+// --- MAIN ---
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Configura o canal de broadcast na memória (capacidade para segurar 16 mensagens na fila se alguém atrasar)
-    let (tx, _) = broadcast::channel(16);
+    // Canal com capacidade adequada
+    let (tx, _) = broadcast::channel(64);
 
     // Endereço fictício do seu inversor/medidor físico Modbus TCP
-    let modbus_target: SocketAddr = "127.0.0.1:5502".parse()?;
-    
+    let modbus_target = "127.0.0.1:5502".parse()?;
+
     // Inicia a tarefa de leitura em segundo plano (Worker)
     tokio::spawn(modbus_reader_task(tx.clone(), modbus_target));
 
     let socket_path = "/tmp/sunspec.sock";
 
-    // 1. Se o arquivo do socket já existir de uma execução anterior, nós o deletamos
-    if Path::new(socket_path).exists() {
-        fs::remove_file(socket_path)?;
-    }
+    // Remoção limpa do socket antigo caso exista
+    let _ = fs::remove_file(socket_path);
 
-    // 2. Criamos o escutador Unix nativo do Tokio
+    // Criamos o escutador Unix nativo do Tokio
     let uds = UnixListener::bind(socket_path)?;
     let uds_stream = UnixListenerStream::new(uds);
 
-    println!("Servidor gRPC Modbus rodando via UDS em: {}", socket_path);
-
-    let telemetry_service = TelemetryServer { tx };
+    println!("Servidor gRPC rodando via UDS em: {socket_path}");
 
     Server::builder()
-        .add_service(SunSpecTelemetryServiceServer::new(telemetry_service))
+        .add_service(SunSpecTelemetryServiceServer::new(TelemetryServer { tx }))
         .serve_with_incoming(uds_stream)
         .await?;
 
